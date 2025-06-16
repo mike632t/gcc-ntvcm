@@ -8,17 +8,29 @@
 #define OPCODE_JMP  0xC3  // jmp nn
 #define OPCODE_RET  0xC9
 
+#ifdef TARGET_BIG_ENDIAN
+const size_t reg_offsets[8] = { 0, 1, 2, 3, 4, 5, 9, 8 }; //bcdehlfa
+#else
 const size_t reg_offsets[8] = { 1, 0, 3, 2, 5, 4, 8, 9 }; //bcdehlfa
+#endif
 
 struct registers
 {
     // the memory layout of these registers is assumed by the code below
 
+#ifdef TARGET_BIG_ENDIAN
+    uint8_t b, c;
+    uint8_t d, e;
+    uint8_t h, l;
+    uint16_t sp;
+    uint8_t a, f;
+#else
     uint8_t c, b;
     uint8_t e, d;
     uint8_t l, h;
     uint16_t sp;
     uint8_t f, a;
+#endif
     uint16_t pc;
 
     // Z80-specific. p == prime registers swapped via exchange instructions
@@ -71,12 +83,40 @@ struct registers
     uint16_t PSW()
     {
         materializeFlags();
+#ifdef TARGET_BIG_ENDIAN
+        return * ( (uint16_t *) & a );
+#else
         return * ( (uint16_t *) & f );
+#endif
     } //PSW
 
+    void SetPSW( uint16_t x )
+    {
+#ifdef TARGET_BIG_ENDIAN
+        * ( (uint16_t *) & a ) = x;
+#else
+        * ( (uint16_t *) & f ) = x;
+#endif
+        unmaterializeFlags();
+    } //SetPSW
+
+#ifdef TARGET_BIG_ENDIAN
+    uint16_t B() const { return * ( (uint16_t *) & b ); }
+    uint16_t D() const { return * ( (uint16_t *) & d ); }
+    uint16_t H() const { return * ( (uint16_t *) & h ); }
+
+    void SetB( uint16_t x ) { * ( (uint16_t *) & b ) = x; }
+    void SetD( uint16_t x ) { * ( (uint16_t *) & d ) = x; }
+    void SetH( uint16_t x ) { * ( (uint16_t *) & h ) = x; }
+#else
     uint16_t B() const { return * ( (uint16_t *) & c ); }
     uint16_t D() const { return * ( (uint16_t *) & e ); }
     uint16_t H() const { return * ( (uint16_t *) & l ); }
+
+    void SetB( uint16_t x ) { * ( (uint16_t *) & c ) = x; }
+    void SetD( uint16_t x ) { * ( (uint16_t *) & e ) = x; }
+    void SetH( uint16_t x ) { * ( (uint16_t *) & l ) = x; }
+#endif
 
     void z80_increment_r() { /* reg.r++; */ } // 4.6% of runtime when the increment is enabled
 
@@ -102,16 +142,6 @@ struct registers
             fX = ( 0 != ( f & 8 ) );
         }
     } //unmaterializeFlags
-
-    void SetPSW( uint16_t x )
-    {
-        * ( (uint16_t *) & f ) = x;
-        unmaterializeFlags();
-    } //SetPSW
-
-    void SetB( uint16_t x ) { * ( (uint16_t *) & c ) = x; }
-    void SetD( uint16_t x ) { * ( (uint16_t *) & e ) = x; }
-    void SetH( uint16_t x ) { * ( (uint16_t *) & l ) = x; }
 
     uint16_t * rpAddress( uint8_t rp )
     {
@@ -176,22 +206,16 @@ struct registers
 
         ac[ next++ ] = fCarry ? 'C' : 'c';
         ac[ next ] = 0;
-    
+
         return ac;
     } //renderFlags
 
-    uint16_t * z80_indexAddress( uint8_t op )
-    {
-        assert( 0xdd == op || 0xfd == op );
-
-        if ( 0xdd == op )
-            return & ix;
-        return & iy;
-    } //z80_indexAddress
-
     void z80_setIndex( uint8_t op, uint16_t val )
     {
-        * z80_indexAddress( op ) = val;
+        if ( 0xdd == op )
+            ix = val;
+        else
+            iy = val;
     } //z80_setIndex
 
     uint16_t z80_getIndex( uint8_t op )
@@ -226,7 +250,11 @@ struct registers
         else
             pval = (uint8_t *) & iy;
 
+#ifdef TARGET_BIG_ENDIAN
+        if ( 1 == hl )
+#else
         if ( 0 == hl )
+#endif
             pval++;
 
         return pval;
@@ -260,6 +288,7 @@ extern void x80_invoke_out( uint8_t x ); // called for the out instruction
 extern void x80_invoke_in( uint8_t x );  // called for the in instruction
 extern void x80_invoke_halt( void );     // called when the 8080 hlt (on Z80 halt) instruction is executed
 extern uint8_t x80_invoke_hook( void );  // called with the OPCODE_HOOK instruction is executed
+extern void x80_hard_exit( const char * pcerror, uint8_t arg1, uint8_t arg2 ); // called on failures to exit the app
 
 // emulator API
 
@@ -268,4 +297,3 @@ extern void x80_trace_instructions( bool trace );              // enable/disable
 extern void x80_end_emulation();                               // stop the emulation
 extern void x80_trace_state( void );                           // trace the registers
 extern const char * x80_render_operation( uint16_t address );  // return a string with the disassembled instruction at address
-extern void x80_hard_exit( const char * pcerror, uint8_t arg1, uint8_t arg2 ); // called on failures to exit the app

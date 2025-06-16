@@ -1,5 +1,11 @@
 #pragma once
 
+#ifdef M68K
+extern "C" int clock_gettime( clockid_t id, struct timespec * res );
+#endif
+
+static bool s_convert_redirected_LF_to_CR = false;
+
 #ifdef WATCOM
 
 #include <conio.h>
@@ -16,6 +22,8 @@ class ConsoleConfiguration
     public:
         ConsoleConfiguration() : outputEstablished( false ), prev_int_23( 0 ) {}
         ~ConsoleConfiguration() {}
+
+        static void ConvertRedirectedLFToCR( bool c ) { s_convert_redirected_LF_to_CR = c; }
 
         void EstablishConsoleOutput( int16_t width = 80, int16_t height = 24 )
         {
@@ -80,7 +88,7 @@ class ConsoleConfiguration
             static const size_t longestEscapeSequence = 10; // probably overkill
             char aReady[ 1 + longestEscapeSequence ];
         #else
-#ifndef OLDGCC      // the several-years-old Gnu C compiler for the RISC-V development boards
+#if !defined( OLDGCC ) && !defined( M68K )
             struct termios orig_termios;
 #endif
         #endif
@@ -339,6 +347,8 @@ class ConsoleConfiguration
             RestoreConsole();
         }
 
+        static void ConvertRedirectedLFToCR( bool c ) { s_convert_redirected_LF_to_CR = c; }
+
         bool IsOutputEstablished() { return outputEstablished; }
 
         #ifdef _WIN32
@@ -403,7 +413,7 @@ class ConsoleConfiguration
                     SetConsoleCtrlHandler( handler, TRUE );
                 }
             #else
-                #ifndef OLDGCC // the several-years-old Gnu C compiler for the RISC-V development boards. that machine has no keyboard support
+                #if !defined( OLDGCC ) && !defined( M68K ) // these will never run on actual Linux and the emulators or platform already are configured for raw keystrokes
                     tcgetattr( 0, &orig_termios );
     
                     // make input raw so it's possible to peek to see if a keystroke is available
@@ -481,11 +491,13 @@ class ConsoleConfiguration
                 tracer.Trace( "old and new console output mode: %04x, %04x\n", oldOutputConsoleMode, dwMode );
                 SetConsoleMode( consoleOutputHandle, dwMode );
             #else
-                if ( isatty( fileno( stdout ) ) )
-                {
-                    printf( "%c[1 q", 27 ); // 1 == cursor blinking block. 
-                    fflush( stdout );
-                }
+                #ifndef M68K
+                    if ( isatty( fileno( stdout ) ) )
+                    {
+                        printf( "%c[1 q", 27 ); // 1 == cursor blinking block. 
+                        fflush( stdout );
+                    }
+                #endif
             #endif
 
                 outputEstablished = true;
@@ -501,7 +513,7 @@ class ConsoleConfiguration
                 #ifdef _WIN32
                     SetConsoleMode( consoleInputHandle, oldInputConsoleMode );
                 #else
-                    #ifndef OLDGCC      // the several-years-old Gnu C compiler for the RISC-V development boards
+                    #if !defined( OLDGCC ) && !defined( M68K )
                         tcsetattr( 0, TCSANOW, &orig_termios );
                     #endif
                 #endif
@@ -514,7 +526,7 @@ class ConsoleConfiguration
         {
             if ( outputEstablished )
             {
-                #ifndef _WIN32
+                #if !defined( _WIN32 ) && !defined( M68K )
                     if ( isatty( fileno( stdout ) ) )
                     {
                         printf( "%c[0m", 27 ); // turn off display attributes
@@ -552,10 +564,12 @@ class ConsoleConfiguration
         {
             if ( isatty( fileno( stdout ) ) )
             {
-                printf( "\x1b[2J" ); // clear the screen
-                printf( "\x1b[1G" ); // cursor to top line
-                printf( "\x1b[1d" ); // cursor to left side
-                fflush( stdout );
+                #if !defined( M68K )
+                    printf( "\x1b[2J" ); // clear the screen
+                    printf( "\x1b[1G" ); // cursor to top line
+                    printf( "\x1b[1d" ); // cursor to left side
+                    fflush( stdout );
+                #endif
             }
         } //SendClsSequence
 
@@ -601,22 +615,37 @@ class ConsoleConfiguration
         static int redirected_getch()
         {
             assert( !isatty( fileno( stdin ) ) );
+            static bool look_ahead_available = false;
+            static char look_ahead = 0;
+
+            if ( look_ahead_available )
+            {
+                look_ahead_available = false;
+                return look_ahead;
+            }
 
             char data;
             if ( 1 == read( 0, &data, 1 ) )
             {
                 // for files with CR/LF, skip the CR and turn the LF into a CR
                 // for files with LF, turn the LF into a CR
-    
-                if ( ( 0x0d == data ) && ( !feof( stdin ) ) )
+
+#ifndef _WIN32
+                if ( ( 13 == data ) && ( !feof( stdin ) ) )
                 {
-                    if ( 0 == read( 0, &data, 1 ) ) // make gcc not complain by checking return code
-                        data = 0x0d; 
+                    if ( 0 == read( 0, &look_ahead, 1 ) ) // make gcc not complain by checking return code
+                        look_ahead = 13;
+
+                    if ( 10 == look_ahead )
+                        data = 10;
+                    else
+                        look_ahead_available = true;
                 }
-    
-                if ( 0x0a == data )
-                    data = 0x0d;
-    
+#endif
+
+                if ( s_convert_redirected_LF_to_CR && ( 10 == data ) )
+                    data = 13;
+
                 return data;
             }
             return EOF;
@@ -705,9 +734,18 @@ class ConsoleConfiguration
             // compute-bound mbasic.com apps run 10x slower than they should because mbasic polls for keyboard input.
             // Workaround: only call _kbhit() if 50 milliseconds has gone by since the last call.
 
+#ifdef M68K // newlib for embedded only has second-level granularity for high_resolution_clock, so use a different codepath for that
+            static struct timespec last_call;
+            static int static_result = clock_gettime( CLOCK_REALTIME, &last_call );
+            struct timespec tNow;
+            int result = clock_gettime( CLOCK_REALTIME, &tNow );
+            uint32_t difference = (uint32_t) ( ( ( tNow.tv_sec - last_call.tv_sec ) * 1000 ) + ( ( tNow.tv_nsec - last_call.tv_nsec ) / 1000000 ) );
+
+#else
             static high_resolution_clock::time_point last_call = high_resolution_clock::now();
             high_resolution_clock::time_point tNow = high_resolution_clock::now();
             long long difference = duration_cast<std::chrono::milliseconds>( tNow - last_call ).count();
+#endif
 
             if ( difference > 50 )
             {

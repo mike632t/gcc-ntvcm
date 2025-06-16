@@ -32,6 +32,7 @@
 //
 
 #include <stdio.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <vector>
@@ -45,11 +46,10 @@
 #include <djl_con.hxx>
 #include <djl_cycle.hxx>
 
-#define  AUTHOR     "David Lee"
-#define  FILENAME   "ntvcm"
-#define  VERSION    "0.1"
+#define FILENAME   "ntvcm"
+#define VERSION    "0.1"
 #if !defined(BUILD)
-#define  BUILD      ""
+#define BUILD      ""
 #endif
 #if !defined(COMMIT_ID)
 #define  COMMIT_ID  ""
@@ -95,7 +95,7 @@ const uint8_t  DPB_OFFSET_HI =       0xff; // where the Disk Parameter Block res
 const uint16_t DPB_OFFSET =          ( ( DPB_OFFSET_HI << 8 ) | DPB_OFFSET_LO );
 
 #define CPM_FILENAME_LEN ( 8 + 3 + 1 + 1 ) // name + type + dot + null
-  
+
 // cr = current record = ( file pointer % 16k ) / 128
 // ex = current extent = ( file pointer % 512k ) / 16k
 // s2 = extent high    = ( file pointer / 512k )
@@ -197,9 +197,34 @@ struct CPMTime // non-standard time structure
     uint16_t minute;
     uint16_t second;
     uint16_t millisecond;
+
+    void swap_endian()
+    {
+        hour = flip_endian16( hour );
+        minute = flip_endian16( minute );
+        second = flip_endian16( second );
+        millisecond = flip_endian16( millisecond );
+    }
 };
 
 #pragma pack( push, 1 )
+struct CPM3DateTime
+{
+    uint16_t day; // day 1 is 1 January 1978
+    uint8_t hour; // packed bcd (nibbles for each digit)
+    uint8_t minute; // packed bcd
+
+    void swap_endian()
+    {
+        day = flip_endian16( day );
+    }
+};
+
+uint8_t packBCD( uint8_t x )
+{
+    return (uint8_t) ( ( ( x / 10 ) << 4 ) | ( x % 10 ) );
+} //packBCD
+
 struct DiskParameterBlock // for BDOS 31. https://www.seasip.info/Cpm/format22.html
 {
     uint16_t spt;    // Number of 128-byte records per track
@@ -212,6 +237,15 @@ struct DiskParameterBlock // for BDOS 31. https://www.seasip.info/Cpm/format22.h
     uint8_t  al1;    // Directory allocation bitmap, second byte
     uint16_t cks;    // Checksum vector size, 0 for a fixed disc
     uint16_t off;    // Offset, number of reserved tracks
+
+    void swap_endian()
+    {
+        spt = flip_endian16( spt );
+        dsm = flip_endian16( dsm );
+        drm = flip_endian16( drm );
+        cks = flip_endian16( cks );
+        off = flip_endian16( off );
+    }
 };
 #pragma pack(pop)
 
@@ -442,7 +476,7 @@ bool ValidCPMFilename( char * pc )
             return true;
         } while ( true );
 
-        return false;            
+        return false;
     } //FindNextFileLinux
 
     DIR * FindFirstFileLinux( const char * pattern, LINUX_FIND_DATA & fd )
@@ -615,7 +649,7 @@ const char * bdos_functions[] =
     "console output",
     "reader input",
     "punch output",
-    "list output",  
+    "list output",
     "direct console i/o",
     "get i/o byte",
     "set i/o byte",
@@ -671,6 +705,10 @@ const char * get_bdos_function( uint8_t id )
         return "get/put program return code";
     if ( 45 == id )
         return "non - cp/m 2.2: set action on hardware error";
+    if ( 48 == id )
+        return "non - cp/m 2.2: empty disk buffers";
+    if ( 105 == id )
+        return "non - cp/m 2.2: get date and time";
 
     return "unknown";
 } //get_bdos_function
@@ -1053,6 +1091,27 @@ void match_vt100( char * pc, size_t len )
 
 #endif // WATCOM
 
+void send_character( uint8_t c )
+{
+    #if defined( _WIN32 ) || defined( WATCOM )
+        if ( 10 == c )
+        {
+            fflush( stdout );
+            _setmode( _fileno( stdout ), _O_BINARY ); // don't convert LF (10) to CR LF (13 10)
+        }
+    #endif
+
+    printf( "%c", c );
+
+    #if defined( _WIN32 ) || defined( WATCOM )
+        if ( 10 == c )
+        {
+            fflush( stdout );
+            _setmode( _fileno( stdout ), _O_TEXT ); // back in text mode
+        }
+    #endif
+} //send_character
+
 // https://en.wikipedia.org/wiki/ANSI_escape_code              vt-100 in 1978, it existed at the same time as CP/M
 // https://en.wikipedia.org/wiki/VT52                          VT52
 // https://mdfs.net/Archive/info-cpm/1985/01/19/053100.htm     Kaypro II / Lear-Siegler ADM-3A
@@ -1068,12 +1127,6 @@ void output_character( uint8_t c )
         g_consoleConfig.EstablishConsoleOutput( 80, 24 );
     }
 
-    // Swallow CR when in terminal mode. LF will translate to CR/LF by the C runtime.
-    // Shen the console is established, apps like Turbo Pascal use CR to update line count during compiles
-
-    if ( ( 0xd == c ) && !g_consoleConfig.IsOutputEstablished() )
-        return;
-
     if ( g_kayproToCP437 )
         c = kaypro_to_cp437( c );
 
@@ -1083,7 +1136,7 @@ void output_character( uint8_t c )
 #ifdef WATCOM
 
     if ( !g_consoleConfig.IsOutputEstablished() )
-        printf( "%c", c );
+        send_character( c );
     else if ( termVT100 == g_termEscape )
     {
         const size_t max_esc_seq = 10;
@@ -1098,7 +1151,7 @@ void output_character( uint8_t c )
             return;
         }
 
-        if ( 0 != esc_len ) 
+        if ( 0 != esc_len )
         {
             append( esc_seq, esc_len, c );
             match_vt100( esc_seq, esc_len + 1 );
@@ -1354,7 +1407,7 @@ void output_character( uint8_t c )
     }
 #else // Windows and Linux
     if ( termVT100 == g_termEscape )
-        printf( "%c", c );
+        send_character( c );
     else if ( termVT52 == g_termEscape )
     {
         static bool s_escapedY = false;     // true if prior two chars were ESC Y
@@ -1407,7 +1460,7 @@ void output_character( uint8_t c )
             s_row = 0xff; // just in case
         }
         else
-            printf( "%c", c );
+            send_character( c );
     }
     else if ( termKayproII == g_termEscape )
     {
@@ -1500,7 +1553,7 @@ void output_character( uint8_t c )
                 tracer.Trace( "ignored character in kaypro escape range: %02x\n", c );
         }
         else
-            printf( "%c", c );
+            send_character( c );
     }
 #endif
 } //output_character
@@ -1531,8 +1584,8 @@ uint8_t map_input( uint8_t input )
             output = 1 + 'C' - 'A';
         else if ( 'I' == next )              // page up
             output = 1 + 'R' - 'A';
-        else if ( 'S' == next )              // del
-            output = 1 + 'G' - 'A';
+        else if ( 'S' == next )              // del maps to ^h
+            output = 1 + 'H' - 'A';
         else
             tracer.Trace( "  no map_input mapping for %02x, second character %02x\n", input, next );
 
@@ -1548,7 +1601,7 @@ uint8_t map_input( uint8_t input )
             tracer.Trace( "read an escape on linux... getting next char again\n" );
             uint8_t nextb = ConsoleConfiguration::portable_getch();
             tracer.Trace( "  nexta: %02x. nextb: %02x\n", nexta, nextb );
-        
+
             if ( '[' == nexta )
             {
                 if ( 'A' == nextb )              // up arrow
@@ -1587,6 +1640,8 @@ uint8_t map_input( uint8_t input )
                 tracer.Trace( "unhandled linux keyboard escape sequence\n" );
         }
     }
+    else if ( 0x7f == input && !g_backspaceToDel ) // linux gives 0x7f DEL when a user presses backspace BS 0x08 on the keyboard. Most CP/M apps like Wordstar don't want this
+        output = 0x08; // BS
 #endif
     else if ( g_backspaceToDel && 0x08 == input )
         output = 0x7f;
@@ -1604,44 +1659,69 @@ char get_next_kbd_char()
 
 bool is_kbd_char_available()
 {
-    return ( ( g_fileInputOffset < g_fileInputText.size() ) || g_consoleConfig.throttled_kbhit() );
-} //is_kbd_char_available    
+    if ( g_fileInputOffset < g_fileInputText.size() )
+        return true;
+
+    if ( g_sleepOnKbdLoop )
+        return g_consoleConfig.throttled_kbhit();
+
+    return g_consoleConfig.portable_kbhit();
+} //is_kbd_char_available
 
 bool cpm_read_console( char * buf, size_t bufsize, uint8_t & out_len )
 {
     char ch = 0;
     out_len = 0;
+
     while ( out_len < (uint8_t) bufsize )
     {
-        ch = get_next_kbd_char();
+        ch = map_input( get_next_kbd_char() );
         tracer.Trace( "  get_next_kbd_char read character %02x -- '%c'\n", ch, printable( ch ) );
 
-        // CP/M read console buffer treats these control characters as special: c, e, h, j, m, r, u, x
-        // per http://www.gaby.de/cpm/manuals/archive/cpm22htm/ch5.htm
-        // Only c, h, j, and m are currently handled correctly.
-        // ^c means exit the currently running app in CP/M if it's the first character in the buffer
+        // behavior per https://techtinkering.com/articles/cpm-standard-console-control-characters/
 
-        if ( ( 3 == ch ) && ( 0 == out_len ) )
+        if ( ( 3 == ch ) && ( 0 == out_len ) ) // ^c exit the currently running app in CP/M if it's the first character in the buffer
             return true;
 
-        if ( '\n' == ch || '\r' == ch )
+        if ( '\n' == ch || '\r' == ch ) // all done; send response
             break;
 
-        if ( 0x7f == ch || 8 == ch ) // backspace (it's not 8 for some reason)
+        if ( 5 == ch ) // ^e. move cursor to beginning of next line without sending line to be processed or adding a newline to the buffer
+            printf( "\n" );
+        else if ( 0x7f == ch || 8 == ch ) // ^h backspace / rubout / delete
         {
             if ( out_len > 0 )
             {
                 printf( "\x8 \x8" );
-                fflush( stdout );
                 out_len--;
             }
         }
+        else if ( 0x10 == ch ) // ^p. start echoing to the printer. ignore
+            continue;
+        else if ( 0x12 == ch ) // ^r. emits a '#' then retypes the current line after a new line
+        {
+            printf( "#\n" );
+            for ( char i = 0; i < out_len; i++ )
+                send_character( buf[ i ] );
+        }
+        else if ( 0x15 == ch ) // ^u. write '#', discard current line, and move to next line for input
+        {
+            printf( "#\n" );
+            out_len = 0;
+        }
+        else if ( 0x18 == ch ) // ^x. removes all characters typed so far and starts again
+        {
+            for ( char i = 0; i < out_len; i++ )
+                printf( "\x8 \x8" );
+            out_len = 0;
+        }
         else
         {
-            printf( "%c", ch );
-            fflush( stdout );
+            send_character( ch );
             buf[ out_len++ ] = ch;
         }
+
+        fflush( stdout );
     }
 
     return false;
@@ -1659,6 +1739,28 @@ void set_bdos_status()
     reg.h = 0;
 } //set_bdos_status
 
+uint16_t days_since_jan1_1978()
+{
+    time_t current_time;
+    struct tm *time_info;
+
+    current_time = time(NULL);
+    time_info = localtime(&current_time);
+
+    struct tm target_date = {0};
+    target_date.tm_year = 1978 - 1900; // Years since 1900
+    target_date.tm_mon = 0;         // January (0-indexed)
+    target_date.tm_mday = 1;
+    target_date.tm_hour = 0;
+    target_date.tm_min = 0;
+    target_date.tm_sec = 0;
+
+    time_t target_time = mktime(&target_date);
+    time_t difference_seconds = current_time - target_time;
+    uint16_t days_since_1978 = (uint16_t) ( difference_seconds / ( 24 * 60 * 60 ) );
+    return days_since_1978;
+} //days_since_jan1_1978
+
 void WriteRandom()
 {
     FCB * pfcb = (FCB *) ( memory + reg.D() );
@@ -1674,7 +1776,7 @@ void WriteRandom()
         {
             uint16_t record = pfcb->GetRandomIOOffset();
             uint32_t file_offset = (uint32_t) record * (uint32_t) 128;
-    
+
             fseek( fp, 0, SEEK_END );
             uint32_t file_size = ftell( fp );
 
@@ -1688,7 +1790,7 @@ void WriteRandom()
                 else
                     tracer.Trace( "  can't seek to extend file with zeros, error %d = %s\n", errno, strerror( errno ) );
             }
-    
+
             if ( file_size >= file_offset )
             {
                 ok = !fseek( fp, file_offset, SEEK_SET );
@@ -1724,6 +1826,28 @@ void WriteRandom()
 
     set_bdos_status();
 } //WriteRandom
+
+#ifdef WATCOM
+
+uint16_t daysSince1978( struct dosdate_t & date )
+{
+    uint16_t days = 0;
+    int i;
+
+    for ( i = 1978; i < date.year; i++ )
+        days += (i % 4 == 0 && i % 100 != 0 || i % 400 == 0) ? 366 : 365; // Account for leap years
+
+    uint16_t daysInMonths[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}; // Non-leap year days
+    if ( ( date.year % 4 == 0 && date.year % 100 != 0 || date.year % 400 == 0 ) && date.month > 2 )
+        daysInMonths[2] = 29; // Leap year
+    for ( i = 1; i < date.month; i++ )
+        days += daysInMonths[i];
+
+    days += date.day;
+    return days;
+} //daysSince1978
+
+#endif
 
 // must return one of OPCODE_NOP or OPCODE_RET
 
@@ -1836,13 +1960,9 @@ uint8_t x80_invoke_hook()
             // a subsequent ^c terminates the application. ^q resumes output then ^c has no effect.
 
             uint8_t ch = reg.e;
-            if ( 0x0d != ch )             // skip carriage return because line feed turns into cr+lf
-            {
-                tracer.Trace( "  bdos console out: %02x == '%c'\n", ch, printable( ch ) );
-                output_character( ch );
-                fflush( stdout );
-            }
-
+            tracer.Trace( "  bdos console out: %02x == '%c'\n", ch, printable( ch ) );
+            output_character( ch );
+            fflush( stdout );
             break;
         }
         case 3:
@@ -1944,11 +2064,8 @@ uint8_t x80_invoke_hook()
                 }
 
                 uint8_t ch = memory[ i++ ];
-                if ( 0x0d != ch )              // skip carriage return because line feed turns into cr+lf
-                {
-                    output_character( ch );
-                    fflush( stdout );
-                }
+                output_character( ch );
+                fflush( stdout );
             }
 
             tracer.TraceBinaryData( memory + reg.D(), count, 4 );
@@ -2034,7 +2151,7 @@ uint8_t x80_invoke_hook()
         case 15:
         {
             // open file. return 255 in a if file not found and 0..3 directory code otherwise
-    
+
             FCB * pfcb = (FCB *) ( memory + reg.D() );
             pfcb->Trace();
             reg.a = 255;
@@ -2091,7 +2208,7 @@ uint8_t x80_invoke_hook()
         case 16:
         {
             // close file. return 255 on error and 0..3 directory code otherwise
-    
+
             FCB * pfcb = (FCB *) ( memory + reg.D() );
             pfcb->Trace();
             reg.a = 255;
@@ -2102,7 +2219,7 @@ uint8_t x80_invoke_hook()
                 if ( fp )
                 {
                     int ret = fclose( fp );
-    
+
                     if ( 0 == ret )
                         reg.a = 0;
                     else
@@ -2186,7 +2303,7 @@ uint8_t x80_invoke_hook()
                 }
                 else
                     tracer.Trace( "WARNING: find first file failed, error %d = %s\n", errno, strerror( errno ) );
-#endif                    
+#endif
             }
             else
                 tracer.Trace( "ERROR: can't parse filename for search for first\n" );
@@ -2275,7 +2392,7 @@ uint8_t x80_invoke_hook()
                 }
                 else
                     tracer.Trace( "ERROR: search for next without a prior successful search for first\n" );
-#endif                    
+#endif
             }
             else
                 tracer.Trace( "ERROR: can't parse filename for search for first\n" );
@@ -2286,7 +2403,7 @@ uint8_t x80_invoke_hook()
         case 19:
         {
             // delete file. return 255 if file not found and 0..3 directory code otherwise
-    
+
             FCB * pfcb = (FCB *) ( memory + reg.D() );
             pfcb->Trace();
             reg.a = 255;
@@ -2320,7 +2437,7 @@ uint8_t x80_invoke_hook()
             // read sequential. return 0 on success or non-0 on failure:
             // reads 128 bytes from cr of the extent and increments cr.
             // if cr overflows, the extent is incremented and cr is set to 0 for the next read
-    
+
             FCB * pfcb = (FCB *) ( memory + reg.D() );
             pfcb->Trace();
             reg.a = 255;
@@ -2348,10 +2465,10 @@ uint8_t x80_invoke_hook()
                     if ( curr < file_size )
                     {
                         fseek( fp, curr, SEEK_SET );
-    
+
                         uint32_t to_read = get_min( file_size - curr, (uint32_t) 128 );
                         memset( g_DMA, 0x1a, 128 ); // fill with ^z, the EOF marker in CP/M
-            
+
                         size_t numread = fread( g_DMA, 1, to_read, fp );
                         if ( numread > 0 )
                         {
@@ -2376,7 +2493,7 @@ uint8_t x80_invoke_hook()
             }
             else
                 tracer.Trace( "ERROR: can't parse filename in read sequential file\n" );
-    
+
             set_bdos_status();
             break;
         }
@@ -2385,7 +2502,7 @@ uint8_t x80_invoke_hook()
             // write sequential. return 0 on success or non-0 on failure (out of disk space)
             // reads 128 bytes from cr of the extent and increments cr.
             // if cr overflows, the extent is incremented and cr is set to 0 for the next read
-    
+
             FCB * pfcb = (FCB *) ( memory + reg.D() );
             pfcb->Trace();
             reg.a = 255;
@@ -2401,7 +2518,7 @@ uint8_t x80_invoke_hook()
                     tracer.Trace( "  writing at offset %#x = %u, file size is %#x = %u, dma %#x = %u\n",
                                   curr, curr, file_size, file_size, dmaOffset, dmaOffset );
                     fseek( fp, curr, SEEK_SET );
-        
+
                     tracer.TraceBinaryData( g_DMA, 128, 2 );
                     size_t numwritten = fwrite( g_DMA, 128, 1, fp );
                     if ( numwritten > 0 )
@@ -2426,7 +2543,7 @@ uint8_t x80_invoke_hook()
         {
             // make file. return 255 if out of space or the file exists. 0..3 directory code otherwise.
             // "the Make function has the side effect of activating the FCB and thus a subsequent open is not necessary."
-    
+
             FCB * pfcb = (FCB *) ( memory + reg.D() );
             pfcb->Trace();
             reg.a = 255;
@@ -2504,7 +2621,7 @@ uint8_t x80_invoke_hook()
         case 25:
         {
             // return current disk. 0..15 corresponding to A..P
-    
+
             reg.a = 0;
             set_bdos_status();
             break;
@@ -2589,18 +2706,18 @@ uint8_t x80_invoke_hook()
                     tracer.Trace( "  read random record %u == %#x\n", record, record );
                     uint32_t file_offset = (uint32_t) record * (uint32_t) 128;
                     memset( g_DMA, 0x1a, 128 ); // fill with ^z, the EOF marker in CP/M
-    
+
                     uint32_t file_size = portable_filelen( fp );
-    
+
                     // OS workaround for app bug: Turbo Pascal expects a read just past the end of file to succeed.
-    
+
                     if ( file_size == file_offset )
                     {
                         tracer.Trace( "  random read at eof, offset %u\n", file_size );
                         reg.a = 1;
                         break;
                     }
-    
+
                     if ( file_size > file_offset )
                     {
                         uint32_t to_read = get_min( file_size - file_offset, (uint32_t) 128 );
@@ -2738,9 +2855,48 @@ uint8_t x80_invoke_hook()
             set_bdos_status();
             break;
         }
+        case 48: // called by various apps
+        {
+            // non - CP/M 2.2: drv_flush - empty disk buffers
+            reg.a = 0;
+            set_bdos_status();
+            break;
+        }
         case 102:
         {
             // Get file date and time (not in cp/m 2.2)
+            break;
+        }
+        case 105: // get date time. cp/m 3.0 and later. Returns seconds in A as packed bcd
+        {
+            CPM3DateTime * ptime = (CPM3DateTime *) ( memory + reg.D() );
+#ifdef WATCOM
+            struct dostime_t time;
+            _dos_gettime( &time );
+
+            ptime->hour = packBCD( (uint8_t) time.hour );
+            ptime->minute = packBCD( (uint8_t) time.minute );
+            reg.a = packBCD( (uint8_t) time.second );
+
+            struct dosdate_t date;
+            _dos_getdate( &date );
+            ptime->day = daysSince1978( date );
+#else
+            system_clock::time_point now = system_clock::now();
+            time_t time_now = system_clock::to_time_t( now );
+            struct tm * plocal = localtime( & time_now );
+
+            ptime->day = 1 + days_since_jan1_1978();
+            ptime->hour = packBCD( (uint8_t) plocal->tm_hour );
+            ptime->minute = packBCD( (uint8_t) plocal->tm_min );
+            reg.a = packBCD( (uint8_t) plocal->tm_sec );
+#endif
+
+#ifdef TARGET_BIG_ENDIAN
+            ptime->swap_endian();
+#endif
+
+            set_bdos_status();
             break;
         }
         case BDOS_GET_TIME:
@@ -2766,6 +2922,10 @@ uint8_t x80_invoke_hook()
             ptime->minute = (uint16_t) plocal->tm_min;
             ptime->second = (uint16_t) plocal->tm_sec;
             ptime->millisecond = (uint16_t) ( ms / 10 ); // hundredths of a second;
+#endif
+
+#ifdef TARGET_BIG_ENDIAN
+            ptime->swap_endian();
 #endif
             set_bdos_status();
             break;
@@ -2880,8 +3040,8 @@ void help()
     printf( "  -l        force CP/M filenames to be lowercase.\n" );
     printf( "  -n        don't sleep for apps in tight bdos 6 loops. (Use\n" );
     printf( "            with apps like nvbasic).\n" );
-    printf( "  -p        show performance information at app exit.\n" ); 
-    printf( "  -s:X      specify clock speed in Hz.\n" ); 
+    printf( "  -p        show performance information at app exit.\n" );
+    printf( "  -s:X      specify clock speed in Hz.\n" );
     printf( "            defaults to 0 which is as fast as possible.\n" );
     printf( "  -t        enable debug tracing to ntvcm.log.\n" );
     printf( "  -V        display version and exit.\n" );
@@ -2907,15 +3067,19 @@ void help()
     exit( 0 );
 } //help
 
-
-void version()  // Display version information
+void version()
 {
-   printf("%s: Version %s%s%s Compiled: ", FILENAME, VERSION, BUILD, COMMIT_ID);
-   if (__DATE__[4] == ' ') 
-      printf( "0%c %c%c%c %s %s\n", __DATE__[5], __DATE__[0], __DATE__[1], __DATE__[2], &__DATE__[7], __TIME__ );
-   else
-      printf( "%c%c %c%c%c %s %s\n", __DATE__[4], __DATE__[5], __DATE__[0], __DATE__[1], __DATE__[2], &__DATE__[7], __TIME__ );
-} // version
+#ifdef NDEBUG
+    const char * flavor = "Release";
+#else
+    const char * flavor = "Debug";
+#endif
+    printf("%s: Version %s%s%s %s Compiled: ", FILENAME, VERSION, BUILD, COMMIT_ID, flavor );
+    if ( ' ' == __DATE__[4] )
+        printf( "0%c %c%c%c %s %s\n", __DATE__[5], __DATE__[0], __DATE__[1], __DATE__[2], &__DATE__[7], __TIME__ );
+    else
+        printf( "%c%c %c%c%c %s %s\n", __DATE__[4], __DATE__[5], __DATE__[0], __DATE__[1], __DATE__[2], &__DATE__[7], __TIME__ );
+} //version
 
 void error( char const * perr = 0 )
 {
@@ -2984,7 +3148,7 @@ bool write_fcb_arg( FCB * arg, char * pc )
 } //write_fcb_arg
 
 static bool load_file( char const * file_path, long & file_size, void * buffer )
-{               
+{
     bool ok = false;
     FILE * fp = fopen( file_path, "rb" );
     if ( 0 != fp )
@@ -3006,19 +3170,23 @@ static bool load_file( char const * file_path, long & file_size, void * buffer )
     return ok;
 } //load_file
 
+#ifdef TARGET_BIG_ENDIAN
+static void setmword( uint16_t offset, uint16_t value ) { * (uint16_t *) & memory[ offset ] = flip_endian16( value ); }
+#else
 static void setmword( uint16_t offset, uint16_t value ) { * (uint16_t *) & memory[ offset ] = value; }
+#endif
 
 int main( int argc, char * argv[] )
 {
     try
     {
         bump_thread_priority(); // for performance benchmarking only
-    
+
         memset( memory, 0, sizeof( memory ) - 1 ); // -1 for 16-bit systems
         memory[ sizeof( memory ) - 1 ] = 0; // again, for 16-bit systems
         memset( &reg, 0, sizeof( reg ) );
         reg.fZ80Mode = true;
-    
+
         char * pCommandTail = (char *) memory + COMMAND_TAIL_OFFSET;
         char * pCommandTailLen = (char *) memory + COMMAND_TAIL_LEN_OFFSET;
         char * pcCOM = 0;
@@ -3032,33 +3200,33 @@ int main( int argc, char * argv[] )
         bool force80x24 = false;
         bool clearDisplayOnExit = true;
         uint64_t processAffinityMask = 0; // by default let the OS decide
-    
+
         for ( int i = 1; i < argc; i++ )
         {
             char *parg = argv[i];
             char c = *parg;
-    
+
             // linux shell scripts pass carriage returns '\r' at the end of strings for DOS-style cr/lf files
-    
+
             char * pR = strchr( parg, '\r' );
             if ( 0 != pR )
                 *pR = 0;
-    
+
             // append arguments past the .com file to the command tail
-    
+
             if ( 0 != pcCOM )
             {
                 size_t tailLen = strlen( pCommandTail ) + strlen( parg ) + 1 + 1; // +1 null termination +1 space
                 if ( tailLen > 127 )
                     error( "command length is too long for the 127 char limit in CP/M" );
-    
+
                 // CP/M puts a space at the start of non-zero-length command tails. Also, add a space between arguments.
-    
+
                 strcat( pCommandTail, " " );
                 strcat( pCommandTail, parg );
                 strupr( pCommandTail );
             }
-    
+
             if ( 0 == pcCOM && ( '-' == c
 #if defined( WATCOM ) || defined( _WIN32 )
                 || '/' == c
@@ -3079,7 +3247,7 @@ int main( int argc, char * argv[] )
 #endif
                 else // Try to match a lower case options
                 {
-#if defined( _WIN32 )  // Command line options are case sensitive on Linux/NetBSD... 
+#if defined( _WIN32 )  // Command line options are case sensitive on Linux/NetBSD...
                     ca = (char) tolower( ca );
 #endif
                     if ( 'h' == ca || '?' == ca )
@@ -3122,7 +3290,7 @@ int main( int argc, char * argv[] )
                     {
                         if ( ':' != parg[2] )
                             error( "colon required after v argument" );
-        
+
                         if ( 'k' == tolower( parg[3] ) )
                             g_termEscape = termKayproII;
                         else if ( '5' == parg[3] )
@@ -3151,7 +3319,7 @@ int main( int argc, char * argv[] )
                     pcArg2 = parg;
             }
         }
-    
+
         tracer.Enable( trace, L"ntvcm.log", true );
         tracer.SetQuiet( true );
         tracer.SetFlushEachTrace( true );
@@ -3165,19 +3333,19 @@ int main( int argc, char * argv[] )
 
         if ( 0 != processAffinityMask )
             set_process_affinity( processAffinityMask );
-    
+
         if ( 0 == pcCOM )
         {
             error( "no CP/M command specified" );
             assume_false;
         }
-    
+
         * pCommandTailLen = (char) strlen( pCommandTail );
         tracer.Trace( "command tail len %d value: '%s'\n", *pCommandTailLen, pCommandTail );
-    
+
         char acCOM[ MAX_PATH ] = {0};
         strcpy( acCOM, pcCOM );
-    
+
         if ( !file_exists( acCOM ) )
         {
             if ( ends_with( acCOM, ".com" ) )
@@ -3189,12 +3357,12 @@ int main( int argc, char * argv[] )
                 {
                     strcpy( acCOM, pcCOM );
                     strcat( acCOM, ".COM" );       // for case-sensitive file systems
-                    
+
                     if ( !file_exists( acCOM ) )
                         error( "can't find command file" );
                 }
             }
-        }                  
+        }
 
         // The Pascal/Z compiler's pasopt.com optimizer has a bug that depends on uninitialized RAM
         // being set to a non-zero value. The location is -30eH bytes from the BDOS address.
@@ -3210,31 +3378,31 @@ int main( int argc, char * argv[] )
             memory[ BDOS_ENTRY - 0x30e ] = 0xff; // address 0xfbee for NTVCM's BDOS address. the value is arbitrary non-zero.
 
         // setup command-line arguments
-    
+
         FCB * arg1 = (FCB *) ( memory + FCB_ARG1_OFFSET );
         FCB * arg2 = (FCB *) ( memory + FCB_ARG2_OFFSET );
         memset( & ( arg1->f ), ' ', 11 ); // 8 filename + 3 type
         memset( & ( arg2->f ), ' ', 11 );
-    
+
         if ( pcArg1 )
         {
             _strupr( pcArg1 );
             write_fcb_arg( arg1, pcArg1 );
-    
+
             if ( pcArg2 )
             {
                 _strupr( pcArg2 );
                 write_fcb_arg( arg2, pcArg2 );
             }
         }
-    
+
         tracer.Trace( "fcb argument 1:\n" );
         arg1->Trace( true );
         tracer.Trace( "fcb argument 2:\n" );
         arg2->Trace( true );
-    
+
         // make memory look like CP/M 2.2. The first 8-byte interrupt vector has this:
-    
+
         memory[0] = OPCODE_JMP;    // jump to warm boot, which likely just exits ntvcm unless overridden by an app.
         memory[1] = 3 + BIOS_JUMP_TABLE_LO; // low byte of BIOS jump table. boot is at -3 from this address. wboot is here.
         memory[2] = BIOS_JUMP_TABLE_HI;     // high byte of BIOS jump table
@@ -3243,7 +3411,7 @@ int main( int argc, char * argv[] )
         memory[5] = OPCODE_JMP;    // jump to the BDOS entry point unless overridden by an app
         memory[6] = BDOS_ENTRY_LO; // these two bytes also point to the first byte above app-available RAM (reserved RAM)
         memory[7] = BDOS_ENTRY_HI;
-    
+
         // The real bios function table is a list of 3-byte entries containing jmp and the address of
         // each of the 16 bios functions (17 including the -1 entry to exit).
         // Here, just hook the jmp instruction and put a pointer to the hook opcode in each address.
@@ -3257,9 +3425,9 @@ int main( int argc, char * argv[] )
         //   fefa-fefb: two bytes of 0 so apps can return instead of a standard app exit.
         //   fefc-fefe: BDOS_ENTRY. JMP to feff for BDOS calls. Where addresses 5-7 jumps to. Hook here breaks WordStar Spellcheck.
         //   feff-feff: OPCODE_HOOK stored here to call back to C code for BDOS calls
-        //   ff00-ff33: BIOS_JUMP_TABLE. bios jump table of 3*17 bytes. (0xff03 is stored at addess 0x1). 
-        //   ff40-ff50: BIOS_FUNCTIONS. where bios jump table addresses point, filled with OPCODE_HOOK. 
-        //   ff60-ff6f: DPD_OFFSET. filled with the Disk Parameter Block for BDOS call 31 Get DPB. 
+        //   ff00-ff33: BIOS_JUMP_TABLE. bios jump table of 3*17 bytes. (0xff03 is stored at addess 0x1).
+        //   ff40-ff50: BIOS_FUNCTIONS. where bios jump table addresses point, filled with OPCODE_HOOK.
+        //   ff60-ff6f: DPD_OFFSET. filled with the Disk Parameter Block for BDOS call 31 Get DPB.
         //   ff70-ffff: unused, filled with 0
         //
         // On a typical CP/M machine:
@@ -3282,16 +3450,16 @@ int main( int argc, char * argv[] )
         memory[ BDOS_ENTRY + 2 ] = BDOS_ENTRY_HI;           // ..
         memory[ BDOS_ENTRY + 3 ] = OPCODE_HOOK;             // to here
         memset( memory + BIOS_FUNCTIONS, OPCODE_HOOK, BIOS_FUNCTION_COUNT );
-    
+
         // fill the BIOS jump table to jmp to unique addresses containing OPCODE_HOOK
-    
+
         for ( uint16_t v = 0; v < BIOS_FUNCTION_COUNT; v++ )
         {
             uint16_t entryOffset = BIOS_JUMP_TABLE + ( 3 * v );
             memory[ entryOffset ] = OPCODE_JMP;
             setmword( entryOffset + 1, BIOS_FUNCTIONS + v );
         }
-    
+
         long file_size = 0;
         bool ok = load_file( acCOM, file_size, memory + 0x100 );
         if ( !ok )
@@ -3299,9 +3467,9 @@ int main( int argc, char * argv[] )
             printf( "unable to load command %s\n", acCOM );
             exit( 1 );
         }
-    
+
         // Use made-up numbers that look believable enough to a CP/M app checking for free disk space. 107k.
-    
+
         DiskParameterBlock * pdpb = (DiskParameterBlock *) ( memory + DPB_OFFSET );
         pdpb->spt = 128;
         pdpb->bsh = 3;
@@ -3313,7 +3481,11 @@ int main( int argc, char * argv[] )
         pdpb->al1 = 0;
         pdpb->cks = 64;
         pdpb->off = 0;
-    
+
+#ifdef TARGET_BIG_ENDIAN
+        pdpb->swap_endian();
+#endif
+
         reg.powerOn();               // set default values of registers
         reg.pc = 0x100;
         reg.sp = BDOS_ENTRY - 2;     // the stack is written to below this address. 2 bytes here are zero for ret from app
@@ -3327,10 +3499,11 @@ int main( int argc, char * argv[] )
             x80_trace_state();
             tracer.Trace( "starting execution of app '%s' size %ld\n", acCOM, file_size );
         }
-    
+
         if ( force80x24 )
             g_consoleConfig.EstablishConsoleOutput( 80, 24 );
-    
+
+        ConsoleConfiguration::ConvertRedirectedLFToCR( true );
         CPUCycleDelay delay( clockrate );
 
 #ifdef WATCOM
@@ -3343,10 +3516,10 @@ int main( int argc, char * argv[] )
         do
         {
             total_cycles += x80_emulate( 10000 );
-    
+
             if ( g_emulationEnded )
                 break;
-    
+
             delay.Delay( total_cycles );
         } while ( true );
 
@@ -3357,9 +3530,9 @@ int main( int argc, char * argv[] )
 #endif
 
         g_consoleConfig.RestoreConsole( clearDisplayOnExit );
-    
+
         CloseFindFirst();
-    
+
         if ( showPerformance )
         {
             char ac[ 100 ];
@@ -3371,7 +3544,7 @@ int main( int argc, char * argv[] )
 #endif
             printf( "elapsed milliseconds: %16s\n", CDJLTrace::RenderNumberWithCommas( elapsedMS, ac ) );
             printf( "%s cycles:      %20s\n", reg.fZ80Mode ? "Z80 " : "8080", CDJLTrace::RenderNumberWithCommas( total_cycles, ac ) );
-    
+
             printf( "clock rate: " );
             if ( 0 == clockrate )
             {
@@ -3381,7 +3554,7 @@ int main( int argc, char * argv[] )
                     printf( "approx ms at 4Mhz: %19s", CDJLTrace::RenderNumberWithCommas( total_ms, ac ) );
                 else
                     printf( "approx ms at 2Mhz: %19s", CDJLTrace::RenderNumberWithCommas( total_ms, ac ) );
-    
+
                 uint16_t days = (uint16_t) ( total_ms / 1000 / 60 / 60 / 24 );
                 uint16_t hours = (uint16_t) ( ( total_ms % ( (uint32_t) 1000 * 60 * 60 * 24 ) ) / 1000 / 60 / 60 );
                 uint16_t minutes = (uint16_t) ( ( total_ms % ( (uint32_t) 1000 * 60 * 60 ) ) / 1000 / 60 );
@@ -3399,7 +3572,7 @@ int main( int argc, char * argv[] )
     }
     catch ( bad_alloc & e )
     {
-        printf( "caught exception bad_alloc -- out of RAM. If in RVOS use -h or -m to add RAM. %s\n", e.what() );
+        printf( "caught exception bad_alloc -- out of RAM. If in RVOS or ARMOS use -h or -m to add RAM. %s\n", e.what() );
     }
     catch ( exception & e )
     {
